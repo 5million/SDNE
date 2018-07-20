@@ -1,0 +1,418 @@
+# coding: utf-8
+import tensorflow as tf
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+from scipy.sparse import dok_matrix
+from pandas import DataFrame
+import pandas as pd
+
+
+class SDNE:
+    def __init__(self, config):
+        self.is_variables_init = False
+        self.config = config
+        self.sess = tf.Session()
+
+        self.struct_list = config.struct_list
+        self.layers = len(self.struct_list)
+        self.W = {}
+        self.b = {}
+        struct_list = self.struct_list
+
+        for i in range(self.layers - 1):
+            name = "encoder" + str(i)
+            self.W[name] = tf.Variable(tf.random_normal([struct_list[i], struct_list[i + 1]]), name=name)
+            self.b[name] = tf.Variable(tf.zeros([struct_list[i + 1]]), name=name)
+        struct_list.reverse()
+        for i in range(self.layers - 1):
+            name = "decoder" + str(i)
+            self.W[name] = tf.Variable(tf.random_normal([struct_list[i], struct_list[i + 1]]), name=name)
+            self.b[name] = tf.Variable(tf.zeros([struct_list[i + 1]]), name=name)
+        self.struct_list.reverse()
+
+        self.adjacent_matriX = tf.placeholder("float", [None, None])
+        self.X = tf.placeholder("float", [None, struct_list[0]])
+
+        self.__make_compute_graph()
+        self.loss = self.__make_loss()
+        self.optimizer = tf.train.RMSPropOptimizer(config.learning_rate).minimize(self.loss)
+
+    def __make_compute_graph(self):
+        def encoder(X):
+            for i in range(self.layers - 1):
+                name = "encoder" + str(i)
+                X = tf.nn.sigmoid(tf.matmul(X, self.W[name]) + self.b[name])
+            return X
+
+        def decoder(X):
+            for i in range(self.layers - 1):
+                name = "decoder" + str(i)
+                X = tf.nn.sigmoid(tf.matmul(X, self.W[name]) + self.b[name])
+            return X
+
+        self.H = encoder(self.X)
+        self.X_reconstruct = decoder(self.H)
+
+    def __make_loss(self):
+
+        def get_1st_loss(H, adj_mini_batch):
+            D = tf.diag(tf.reduce_sum(adj_mini_batch, 1))
+            L = D - adj_mini_batch
+            return 2 * tf.trace(tf.matmul(tf.matmul(tf.transpose(H), L), H))
+
+        def get_2nd_loss(X, newX, beta):
+            B = X * (beta - 1) + 1
+            return tf.reduce_sum(tf.pow((newX - X) * B, 2))
+
+        def get_reg_loss(weight, biases):
+            ret = tf.add_n([tf.nn.l2_loss(w) for w in weight.values()])
+            ret = ret + tf.add_n([tf.nn.l2_loss(b) for b in biases.values()])
+            return ret
+
+        # Loss function
+        self.loss_2nd = get_2nd_loss(self.X, self.X_reconstruct, self.config.beta)
+        self.loss_1st = get_1st_loss(self.H, self.adjacent_matriX)
+        self.loss_reg = get_reg_loss(self.W, self.b)
+
+        return self.config.gamma * self.loss_1st + self.config.alpha * self.loss_2nd + self.config.reg * self.loss_reg
+
+    def do_variables_init(self, data):
+        def assign(a, b):
+            op = a.assign(b)
+            self.sess.run(op)
+
+        init = tf.global_variables_initializer()
+        self.sess.run(init)
+
+        if self.config.DBN_init:
+            shape = self.struct_list
+            myRBMs = []
+            for i in range(len(shape) - 1):
+                myRBM = rbm([shape[i], shape[i + 1]],
+                            {'batch_size': self.config.DBN_batch_size, 'learning_rate': self.config.DBN_learning_rate})
+                myRBMs.append(myRBM)
+                for epoch in range(self.config.DBN_epochs):
+                    error = 0
+                    for batch in range(0, data.N, self.config.DBN_batch_size):
+                        mini_batch = data.sample(self.config.DBN_batch_size).X
+                        for k in range(len(myRBMs) - 1):
+                            mini_batch = myRBMs[k].getH(mini_batch)
+                        error += myRBM.fit(mini_batch)
+                    print("rbm epochs:", epoch, "error : ", error)
+
+                W, bv, bh = myRBM.getWb()
+                name = "encoder" + str(i)
+                assign(self.W[name], W)
+                assign(self.b[name], bh)
+                name = "decoder" + str(self.layers - i - 2)
+                assign(self.W[name], W.transpose())
+                assign(self.b[name], bv)
+        self.is_Init = True
+
+    def __get_feed_dict(self, data):
+        return {self.X: data.X, self.adjacent_matriX: data.adjacent_matriX}
+
+    def fit(self, data):
+        feed_dict = self.__get_feed_dict(data)
+        ret, _ = self.sess.run((self.loss, self.optimizer), feed_dict=feed_dict)
+        return ret
+
+    def get_loss(self, data):
+        feed_dict = self.__get_feed_dict(data)
+        return self.sess.run(self.loss, feed_dict=feed_dict)
+
+    def get_embedding(self, data):
+        return self.sess.run(self.H, feed_dict=self.__get_feed_dict(data))
+
+    def get_W(self):
+        return self.sess.run(self.W)
+
+    def get_B(self):
+        return self.sess.run(self.b)
+
+    def close(self):
+        self.sess.close()
+
+
+class rbm:
+    def __init__(self, shape, para):
+        # shape[0] means the number of visible units
+        # shape[1] means the number of hidden units
+        self.para = para
+        self.sess = tf.Session()
+        stddev = 1.0 / np.sqrt(shape[0])
+        self.W = tf.Variable(tf.random_normal([shape[0], shape[1]], stddev=stddev), name="Wii")
+        self.bv = tf.Variable(tf.zeros(shape[0]), name="a")
+        self.bh = tf.Variable(tf.zeros(shape[1]), name="b")
+        self.v = tf.placeholder("float", [None, shape[0]])
+        init_op = tf.global_variables_initializer()
+        self.sess.run(init_op)
+        self.buildModel()
+        print("rbm init completely")
+        pass
+
+    def buildModel(self):
+        self.h = self.sample(tf.sigmoid(tf.matmul(self.v, self.W) + self.bh))
+        # gibbs_sample
+        v_sample = self.sample(tf.sigmoid(tf.matmul(self.h, tf.transpose(self.W)) + self.bv))
+        h_sample = self.sample(tf.sigmoid(tf.matmul(v_sample, self.W) + self.bh))
+        lr = self.para["learning_rate"] / tf.to_float(self.para["batch_size"])
+        W_adder = self.W.assign_add(
+            lr * (tf.matmul(tf.transpose(self.v), self.h) - tf.matmul(tf.transpose(v_sample), h_sample)))
+        bv_adder = self.bv.assign_add(lr * tf.reduce_mean(self.v - v_sample, 0))
+        bh_adder = self.bh.assign_add(lr * tf.reduce_mean(self.h - h_sample, 0))
+        self.upt = [W_adder, bv_adder, bh_adder]
+        self.error = tf.reduce_sum(tf.pow(self.v - v_sample, 2))
+
+    def fit(self, data):
+        _, ret = self.sess.run((self.upt, self.error), feed_dict={self.v: data})
+        return ret
+
+    def sample(self, probs):
+        return tf.floor(probs + tf.random_uniform(tf.shape(probs), 0, 1))
+
+    def getWb(self):
+        return self.sess.run([self.W, self.bv, self.bh])
+
+    def getH(self, data):
+        return self.sess.run(self.h, feed_dict={self.v: data})
+
+
+class Dotdict(dict):
+    """dot.notation access to dictionary attributes"""
+    __getattr__ = dict.get
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
+
+
+class Graph(object):
+    def __init__(self, config, train_data_table):
+        self.start = 0
+        self.is_epoch_end = False
+        self.buyer_seller_dict = {}
+        self.struct_list = config.struct_list
+
+        self.train_data_df = DataFrame(train_data_table)
+        self.le0 = LabelEncoder()
+        self.le1 = LabelEncoder()
+        self.le0.fit(self.train_data_df[0])
+        self.le1.fit(self.train_data_df[1])
+        self.train_data_df[0] = self.le0.transform(self.train_data_df[0])
+        self.train_data_df[1] = self.le1.transform(self.train_data_df[1])
+
+        self.buyer_num = max(self.train_data_df[0]) + 1
+        self.cate_num = max(self.train_data_df[1]) + 1
+        self.total_num = self.cate_num + self.buyer_num
+
+        self.adj_matrix = dok_matrix((self.total_num, self.total_num), np.int_)
+
+        for i in range(self.train_data_df.shape[0]):
+            buyer_id = self.train_data_df.loc[i][0]
+            cate_id = self.train_data_df.loc[i][1]
+            self.adj_matrix[buyer_id, cate_id + self.buyer_num] = 1
+            self.adj_matrix[cate_id + self.buyer_num, buyer_id] = 1
+
+        self.adj_matrix = self.adj_matrix.tocsr()
+        self.N = self.total_num
+        config.N = self.N
+        self.E = self.adj_matrix.count_nonzero() / 2
+        self.order = np.arange(self.total_num)
+        print("Graph initialized! buyers:{}, cates:{}, all nodes:{}, edges:{}".format(
+            self.buyer_num, self.cate_num, self.total_num, self.E))
+
+    def sample(self, batch_size, do_shuffle=True):
+        if self.is_epoch_end:
+            if do_shuffle:
+                np.random.shuffle(self.order[0:self.N])
+            else:
+                self.order = np.sort(self.order)
+            self.start = 0
+            self.is_epoch_end = False
+        mini_batch = Dotdict()
+        end = min(self.N, self.start + batch_size)
+        index = self.order[self.start:end]
+        mini_batch.X = self.adj_matrix[index].toarray()
+        mini_batch.adjacent_matriX = self.adj_matrix[index].toarray()[:][:, index]
+        if end == self.N:
+            end = 0
+            self.is_epoch_end = True
+        self.start = end
+        return mini_batch
+
+
+class OdpsOp(object):
+    def __init__(self):
+        pass
+
+    def load_odps(self, table_path, selected_cols):
+        reader = tf.python_io.TableReader(table_path, selected_cols)
+        total_rows = int(reader.get_row_count())
+        total_cols = len(reader.read(1))
+        print('total_rows:{}, total_cols:{}'.format(total_rows, total_cols))
+
+        table = np.zeros((total_rows, total_cols))
+        for i in range(total_rows):
+            record = reader.read(1)
+            table[i] = (record[0])
+
+        reader.close()
+        print('Load odps table over!')
+        return table
+
+    def save_odps(self, table_path):
+        writer = tf.TableRecordWriter(output_table_path)
+        cols = []
+        cols.append(tf.placeholder(tf.string))
+        for i in range(64):
+            cols.append(tf.placeholder(tf.float32))
+        users = []
+        for i in np.arange(train_graph_data.buyer_num):
+            user = train_graph_data.le0.inverse_transform(i)
+            users.append([str(int(user))])
+        print(embedding.shape)
+        res = np.hstack((users, embedding[:train_graph_data.buyer_num]))
+        res = res.T
+        res.tolist()
+        feed_dict = dict(zip(cols, res))
+        write_to_table = writer.write(range(65), cols)
+        close_table = writer.close()
+
+        with tf.Session() as sess:
+            sess.run(tf.global_variables_initializer())
+            sess.run(tf.local_variables_initializer())
+            coord = tf.train.Coordinator()
+            threads = tf.train.start_queue_runners(coord=coord)
+
+            sess.run(write_to_table, feed_dict=feed_dict)
+            sess.run(close_table)
+            coord.request_stop()
+            coord.join(threads)
+        print("Write odps table over!")
+
+
+class Evaluation(object):
+    def __init__(self, test_data_table, embedding):
+        self.embedding = embedding
+        self.test_data_table = test_data_table
+
+        row, col = test_data_table.shape
+        x = tf.placeholder(tf.float32, [row, 64])
+        y = tf.placeholder(tf.float32, [col, 1])
+
+        self.W = tf.Variable(tf.random_normal([row, col]))
+        self.b = tf.Variable(tf.zeros(row)+0.1, name="a")
+
+        layer1 = tf.layers.dense(x, units=5, activation=tf.nn.sigmoid)
+        logits = tf.layers.dense(layer1, units=1, activation=None)
+
+        init_op = tf.global_variables_initializer()
+        sess = tf.Session()
+        sess.run(init_op)
+        sess.run(layer1)
+
+        print("rbm init completely")
+
+    def compute_precision(self):
+        pass
+
+    def compute_recall(self):
+        pass
+
+
+if __name__ == "__main__":
+    # para in model
+    tf.app.flags.DEFINE_float("alpha", 1, "the parameter for L1st loss function")
+    tf.app.flags.DEFINE_float("gamma", 0.2, "the parameter for L2nd loss function")
+    tf.app.flags.DEFINE_float("reg", 0.1, "the parameter for regularize loss function")
+    tf.app.flags.DEFINE_string("structure", "", "the structure of network")
+
+    # para in train
+    tf.app.flags.DEFINE_float("learning_rate", 0.01, "learning rate")
+    tf.app.flags.DEFINE_integer("batch_size", 64, "batch size")
+    tf.app.flags.DEFINE_float("beta", 2, "the weight balanced value to reconstruct non-zero element more")
+    tf.app.flags.DEFINE_integer("epochs_limit", 200, "epochs limit")
+    tf.app.flags.DEFINE_integer("display", 1, "display the performance in every 5 epochs")
+
+    # para about dbn
+    tf.app.flags.DEFINE_bool("DBN_init", True, "init paras by Deep Brief Network")
+    tf.app.flags.DEFINE_integer("DBN_epochs", 50, "epoch num for DBN")
+    tf.app.flags.DEFINE_integer("DBN_batch_size", 64, "batch size for DBN")
+    tf.app.flags.DEFINE_float("DBN_learning_rate", 0.1, "learning rate for DBN")
+
+    # para for evalution
+    FLAGS = tf.app.flags.FLAGS
+    config = Dotdict()
+    config.alpha = FLAGS.alpha
+    config.gamma = FLAGS.gamma
+    config.reg = FLAGS.reg
+    config.structure = FLAGS.structure
+    config.struct_list = [int(x) for x in config.structure.split(',')]
+
+    config.learning_rate = FLAGS.learning_rate
+    config.batch_size = FLAGS.batch_size
+    config.beta = FLAGS.beta
+    config.epochs_limit = FLAGS.epochs_limit
+    config.display = FLAGS.display
+
+    config.DBN_init = FLAGS.DBN_init
+    config.DBN_epochs = FLAGS.DBN_epochs
+    config.DBN_batch_size = FLAGS.DBN_batch_size
+    config.DBN_learning_rate = FLAGS.DBN_learning_rate
+
+    train_table_path = "odps://search_offline_dev/tables/zt_user_cate_train"
+    test_table_path = "odps://search_offline_dev/tables/zt_user_cate_test"
+    train_col = "buyer_id, cate_level2_id"
+    test_col = "buyer_id, label"
+    output_table_path = "odps://search_offline_dev/tables/zt_res"
+
+    # 读取odps训练表和测试表
+    train_data_table = OdpsOp().load_odps(train_table_path, train_col)
+    test_data_table = OdpsOp().load_odps(test_table_path, test_col)
+
+    # 构建图
+    train_graph_data = Graph(config, train_data_table)
+
+    # 构建模型
+    model = SDNE(config)
+    model.do_variables_init(train_graph_data)
+
+    # 训练模型
+    embedding = None
+    batch_size = config.batch_size
+    display = config.display
+    while True:
+        mini_batch = train_graph_data.sample(batch_size, do_shuffle=False)
+        if embedding is None:
+            embedding = model.get_embedding(mini_batch)
+        else:
+            embedding = np.vstack((embedding, model.get_embedding(mini_batch)))
+        if train_graph_data.is_epoch_end:
+            break
+
+    epochs = 0
+
+    while True:
+        mini_batch = train_graph_data.sample(batch_size)
+        loss = model.fit(mini_batch)
+        if train_graph_data.is_epoch_end:
+            epochs += 1
+            loss = 0
+            if epochs % display == 0:
+                embedding = None
+                while True:
+                    mini_batch = train_graph_data.sample(batch_size, do_shuffle=False)
+                    loss += model.get_loss(mini_batch)
+                    if embedding is None:
+                        embedding = model.get_embedding(mini_batch)
+                    else:
+                        embedding = np.vstack((embedding, model.get_embedding(mini_batch)))
+                    if train_graph_data.is_epoch_end:
+                        break
+                print("Epoch : %d loss : %.3f" % (epochs, loss))
+
+            if epochs == config.epochs_limit:
+                Evaluation(embedding)
+                print("exceed epochs limit terminating")
+                break
+
+
