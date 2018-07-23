@@ -5,6 +5,63 @@ from sklearn.preprocessing import LabelEncoder
 from scipy.sparse import dok_matrix
 from pandas import DataFrame
 import pandas as pd
+import random
+
+
+class Graph(object):
+    def __init__(self, config, buyer_cate):
+        self.start = 0
+        self.is_epoch_end = False
+        self.buyer_seller_dict = {}
+        self.struct_list = config.struct_list
+        self.buyer_cate = buyer_cate
+
+        self.le0 = LabelEncoder()
+        self.le1 = LabelEncoder()
+
+        self.le0.fit(self.buyer_cate['buyer_id'])
+        self.le1.fit(self.buyer_cate['cate_id'])
+        self.buyer_cate['buyer_id'] = self.le0.transform(self.buyer_cate['buyer_id'])
+        self.buyer_cate['cate_id'] = self.le1.transform(self.buyer_cate['cate_id'])
+
+        self.buyer_num = max(self.buyer_cate['buyer_id']) + 1
+        self.cate_num = max(self.buyer_cate['cate_id']) + 1
+        self.total_num = self.cate_num + self.buyer_num
+
+        self.adj_matrix = dok_matrix((self.total_num, self.total_num), np.int_)
+
+        for i in range(self.total_num):
+            buyer_id = self.buyer_cate.loc[i]['buyer_id']
+            cate_id = self.buyer_cate.loc[i]['cate_id']
+            self.adj_matrix[buyer_id, cate_id + self.buyer_num] = 1
+            self.adj_matrix[cate_id + self.buyer_num, buyer_id] = 1
+
+        self.adj_matrix = self.adj_matrix.tocsr()
+        self.N = self.total_num
+        config.N = self.N
+        self.E = self.adj_matrix.count_nonzero() / 2
+        self.order = np.arange(self.total_num)
+        print("Graph initialized! buyers:{}, cates:{}, all nodes:{}, edges:{}".format(
+            self.buyer_num, self.cate_num, self.total_num, self.E))
+
+    def sample(self, batch_size, do_shuffle=True):
+        if self.is_epoch_end:
+            if do_shuffle:
+                np.random.shuffle(self.order[0:self.N])
+            else:
+                self.order = np.sort(self.order)
+            self.start = 0
+            self.is_epoch_end = False
+        mini_batch = Dotdict()
+        end = min(self.N, self.start + batch_size)
+        index = self.order[self.start:end]
+        mini_batch.X = self.adj_matrix[index].toarray()
+        mini_batch.adjacent_matriX = self.adj_matrix[index].toarray()[:][:, index]
+        if end == self.N:
+            end = 0
+            self.is_epoch_end = True
+        self.start = end
+        return mini_batch
 
 
 class SDNE:
@@ -185,198 +242,52 @@ class Dotdict(dict):
     __delattr__ = dict.__delitem__
 
 
-class Graph(object):
-    def __init__(self, config, train_data_table):
-        self.start = 0
-        self.is_epoch_end = False
-        self.buyer_seller_dict = {}
-        self.struct_list = config.struct_list
-
-        self.train_data_df = DataFrame(train_data_table)
-        self.le0 = LabelEncoder()
-        self.le1 = LabelEncoder()
-        self.le0.fit(self.train_data_df[0])
-        self.le1.fit(self.train_data_df[1])
-        self.train_data_df[0] = self.le0.transform(self.train_data_df[0])
-        self.train_data_df[1] = self.le1.transform(self.train_data_df[1])
-
-        self.buyer_num = max(self.train_data_df[0]) + 1
-        self.cate_num = max(self.train_data_df[1]) + 1
-        self.total_num = self.cate_num + self.buyer_num
-
-        self.adj_matrix = dok_matrix((self.total_num, self.total_num), np.int_)
-
-        for i in range(self.train_data_df.shape[0]):
-            buyer_id = self.train_data_df.loc[i][0]
-            cate_id = self.train_data_df.loc[i][1]
-            self.adj_matrix[buyer_id, cate_id + self.buyer_num] = 1
-            self.adj_matrix[cate_id + self.buyer_num, buyer_id] = 1
-
-        self.adj_matrix = self.adj_matrix.tocsr()
-        self.N = self.total_num
-        config.N = self.N
-        self.E = self.adj_matrix.count_nonzero() / 2
-        self.order = np.arange(self.total_num)
-        print("Graph initialized! buyers:{}, cates:{}, all nodes:{}, edges:{}".format(
-            self.buyer_num, self.cate_num, self.total_num, self.E))
-
-    def sample(self, batch_size, do_shuffle=True):
-        if self.is_epoch_end:
-            if do_shuffle:
-                np.random.shuffle(self.order[0:self.N])
-            else:
-                self.order = np.sort(self.order)
-            self.start = 0
-            self.is_epoch_end = False
-        mini_batch = Dotdict()
-        end = min(self.N, self.start + batch_size)
-        index = self.order[self.start:end]
-        mini_batch.X = self.adj_matrix[index].toarray()
-        mini_batch.adjacent_matriX = self.adj_matrix[index].toarray()[:][:, index]
-        if end == self.N:
-            end = 0
-            self.is_epoch_end = True
-        self.start = end
-        return mini_batch
-
-
-class OdpsOp(object):
-    def __init__(self):
-        pass
-
-    def load_odps(self, table_path, selected_cols):
-        reader = tf.python_io.TableReader(table_path, selected_cols)
-        total_rows = int(reader.get_row_count())
-        total_cols = len(reader.read(1))
-        print('total_rows:{}, total_cols:{}'.format(total_rows, total_cols))
-
-        table = np.zeros((total_rows, total_cols))
-        for i in range(total_rows):
-            record = reader.read(1)
-            table[i] = (record[0])
-
-        reader.close()
-        print('Load odps table over!')
-        return table
-
-    def save_odps(self, table_path):
-        writer = tf.TableRecordWriter(output_table_path)
-        cols = []
-        cols.append(tf.placeholder(tf.string))
-        for i in range(64):
-            cols.append(tf.placeholder(tf.float32))
-        users = []
-        for i in np.arange(train_graph_data.buyer_num):
-            user = train_graph_data.le0.inverse_transform(i)
-            users.append([str(int(user))])
-        print(embedding.shape)
-        res = np.hstack((users, embedding[:train_graph_data.buyer_num]))
-        res = res.T
-        res.tolist()
-        feed_dict = dict(zip(cols, res))
-        write_to_table = writer.write(range(65), cols)
-        close_table = writer.close()
-
-        with tf.Session() as sess:
-            sess.run(tf.global_variables_initializer())
-            sess.run(tf.local_variables_initializer())
-            coord = tf.train.Coordinator()
-            threads = tf.train.start_queue_runners(coord=coord)
-
-            sess.run(write_to_table, feed_dict=feed_dict)
-            sess.run(close_table)
-            coord.request_stop()
-            coord.join(threads)
-        print("Write odps table over!")
-
-
-class Evaluation(object):
-    def __init__(self, test_data_table, embedding):
-        self.embedding = embedding
-        self.test_data_table = test_data_table
-
-        row, col = test_data_table.shape
-        x = tf.placeholder(tf.float32, [row, 64])
-        y = tf.placeholder(tf.float32, [col, 1])
-
-        self.W = tf.Variable(tf.random_normal([row, col]))
-        self.b = tf.Variable(tf.zeros(row)+0.1, name="a")
-
-        layer1 = tf.layers.dense(x, units=5, activation=tf.nn.sigmoid)
-        logits = tf.layers.dense(layer1, units=1, activation=None)
-
-        init_op = tf.global_variables_initializer()
-        sess = tf.Session()
-        sess.run(init_op)
-        sess.run(layer1)
-
-        print("rbm init completely")
-
-    def compute_precision(self):
-        pass
-
-    def compute_recall(self):
-        pass
+def add_layer(inputs, in_size, out_size, activation_function=None):
+    Weights = tf.Variable(tf.random_normal([in_size, out_size]))
+    biases = tf.Variable(tf.zeros([1, out_size]) + 0.1)
+    Wx_plus_b = tf.matmul(inputs, Weights) + biases
+    if activation_function is None:
+        outputs = Wx_plus_b
+    else:
+        outputs = activation_function(Wx_plus_b)
+    return outputs
 
 
 if __name__ == "__main__":
-    # para in model
-    tf.app.flags.DEFINE_float("alpha", 1, "the parameter for L1st loss function")
-    tf.app.flags.DEFINE_float("gamma", 0.2, "the parameter for L2nd loss function")
-    tf.app.flags.DEFINE_float("reg", 0.1, "the parameter for regularize loss function")
-    tf.app.flags.DEFINE_string("structure", "", "the structure of network")
 
-    # para in train
-    tf.app.flags.DEFINE_float("learning_rate", 0.01, "learning rate")
-    tf.app.flags.DEFINE_integer("batch_size", 64, "batch size")
-    tf.app.flags.DEFINE_float("beta", 2, "the weight balanced value to reconstruct non-zero element more")
-    tf.app.flags.DEFINE_integer("epochs_limit", 200, "epochs limit")
-    tf.app.flags.DEFINE_integer("display", 1, "display the performance in every 5 epochs")
-
-    # para about dbn
-    tf.app.flags.DEFINE_bool("DBN_init", True, "init paras by Deep Brief Network")
-    tf.app.flags.DEFINE_integer("DBN_epochs", 50, "epoch num for DBN")
-    tf.app.flags.DEFINE_integer("DBN_batch_size", 64, "batch size for DBN")
-    tf.app.flags.DEFINE_float("DBN_learning_rate", 0.1, "learning rate for DBN")
-
-    # para for evalution
-    FLAGS = tf.app.flags.FLAGS
     config = Dotdict()
-    config.alpha = FLAGS.alpha
-    config.gamma = FLAGS.gamma
-    config.reg = FLAGS.reg
-    config.structure = FLAGS.structure
+    config.alpha = 1
+    config.gamma = 0.2
+    config.reg = 0.1
+    config.structure = '675, 64'
     config.struct_list = [int(x) for x in config.structure.split(',')]
 
-    config.learning_rate = FLAGS.learning_rate
-    config.batch_size = FLAGS.batch_size
-    config.beta = FLAGS.beta
-    config.epochs_limit = FLAGS.epochs_limit
-    config.display = FLAGS.display
+    config.learning_rate = 0.001
+    config.batch_size = 64
+    config.beta = 2
+    config.epochs_limit = 20
+    config.display = 5
 
-    config.DBN_init = FLAGS.DBN_init
-    config.DBN_epochs = FLAGS.DBN_epochs
-    config.DBN_batch_size = FLAGS.DBN_batch_size
-    config.DBN_learning_rate = FLAGS.DBN_learning_rate
+    config.DBN_init = False
+    config.DBN_epochs = 120
+    config.DBN_batch_size = 64
+    config.DBN_learning_rate = 0.1
 
-    train_table_path = "odps://search_offline_dev/tables/zt_user_cate_train"
-    test_table_path = "odps://search_offline_dev/tables/zt_user_cate_test"
-    train_col = "buyer_id, cate_level2_id"
-    test_col = "buyer_id, label"
-    output_table_path = "odps://search_offline_dev/tables/zt_res"
+    input_table_path = "D:\PycharmProjects\zhutong_SDNE\Data\sdne_data_label.txt"
+    output_table_path = "D:\PycharmProjects\zhutong_SDNE\Data"
 
-    # 读取odps训练表和测试表
-    train_data_table = OdpsOp().load_odps(train_table_path, train_col)
-    test_data_table = OdpsOp().load_odps(test_table_path, test_col)
+    # 载入数据
+    buyer_cate_label = pd.read_csv(input_table_path, sep='\t')
+    buyer_cate = buyer_cate_label[['buyer_id', 'cate_id']]
 
     # 构建图
-    train_graph_data = Graph(config, train_data_table)
+    train_graph_data = Graph(config, buyer_cate)
 
     # 构建模型
     model = SDNE(config)
     model.do_variables_init(train_graph_data)
 
-    # 训练模型
+    # 训练
     embedding = None
     batch_size = config.batch_size
     display = config.display
@@ -392,27 +303,107 @@ if __name__ == "__main__":
     epochs = 0
 
     while True:
-        mini_batch = train_graph_data.sample(batch_size)
-        loss = model.fit(mini_batch)
-        if train_graph_data.is_epoch_end:
-            epochs += 1
-            loss = 0
-            if epochs % display == 0:
-                embedding = None
-                while True:
-                    mini_batch = train_graph_data.sample(batch_size, do_shuffle=False)
-                    loss += model.get_loss(mini_batch)
-                    if embedding is None:
-                        embedding = model.get_embedding(mini_batch)
-                    else:
-                        embedding = np.vstack((embedding, model.get_embedding(mini_batch)))
-                    if train_graph_data.is_epoch_end:
-                        break
-                print("Epoch : %d loss : %.3f" % (epochs, loss))
+        with model.sess.as_default():
+            mini_batch = train_graph_data.sample(batch_size)
+            loss = model.fit(mini_batch)
+            if train_graph_data.is_epoch_end:
+                epochs += 1
+                loss = 0
+                if epochs % display == 0:
+                    embedding = None
+                    while True:
+                        mini_batch = train_graph_data.sample(batch_size, do_shuffle=False)
+                        loss += model.get_loss(mini_batch)
+                        if embedding is None:
+                            embedding = model.get_embedding(mini_batch)
+                        else:
+                            embedding = np.vstack((embedding, model.get_embedding(mini_batch)))
+                        if train_graph_data.is_epoch_end:
+                            break
+                    print("Epoch : %d loss : %.3f" % (epochs, loss))
 
-            if epochs == config.epochs_limit:
-                Evaluation(embedding)
-                print("exceed epochs limit terminating")
-                break
+                if epochs == config.epochs_limit:
+                    print("exceed epochs limit terminating")
+                    break
 
+    # 分类器模型
+    buyer_num = train_graph_data.buyer_num
+    train_len = int(buyer_num*0.7)
+    users = []
+    for i in np.arange(buyer_num):
+        user = train_graph_data.le0.inverse_transform(i)
+        users.append([int(user)])
+    res = np.hstack((users, embedding[:buyer_num]))
+    res_cols = []
+    res_cols.append('buyer_id')
+    for i in range(64):
+        name = 'c' + str(i)
+        res_cols.append(name)
+    res = DataFrame(res, columns=res_cols)
 
+    data = pd.merge(res, buyer_cate_label, how='inner', on='buyer_id')
+
+    order = np.arange(0, buyer_num)
+    random.shuffle(order)
+    train_order = order[:train_len].tolist()
+    test_order = order[train_len: buyer_num].tolist()
+
+    train_data = data.loc[train_order]
+    test_data = data.loc[test_order]
+
+    col = res_cols[1:]
+    x_data = np.array(train_data[col])[1:]
+    y_data = train_data['label']
+
+    xs = tf.placeholder(tf.float32, [None, 64])
+    ys = tf.placeholder(tf.float32,)
+
+    # add hidden layer 输入值是 xs，在隐藏层有 5 个神经元
+    l1 = add_layer(xs, 64, 5, activation_function=tf.nn.relu)
+    # add output layer 输入值是隐藏层 l1，在预测层输出 1 个结果
+    prediction = add_layer(l1, 5, 1, activation_function=None)
+
+    # the error between prediciton and real data
+    loss = tf.reduce_mean(tf.reduce_sum(tf.square(ys - prediction),
+                                        reduction_indices=[1]))
+    train_step = tf.train.GradientDescentOptimizer(0.1).minimize(loss)
+
+    init = tf.global_variables_initializer()
+    sess = tf.Session()
+    sess.run(init)
+
+    for i in range(buyer_num):
+        for (x, y) in zip(x_data, y_data):
+            x = x[:, np.newaxis]
+            sess.run(train_step, feed_dict={xs: x.T, ys: y})
+            if i % 50 == 0:
+                print(sess.run(loss, feed_dict={xs: x_data, ys: y_data}))
+
+    # 写表
+    writer = tf.TableRecordWriter(output_table_path)
+    cols = []
+    cols.append(tf.placeholder(tf.string))
+    for i in range(64):
+        cols.append(tf.placeholder(tf.float32))
+    users = []
+    for i in np.arange(train_graph_data.buyer_num):
+        user = train_graph_data.le0.inverse_transform(i)
+        users.append([str(int(user))])
+    print(embedding.shape)
+    res = np.hstack((users, embedding[:train_graph_data.buyer_num]))
+    res = res.T
+    res.tolist()
+    feed_dict = dict(zip(cols, res))
+    write_to_table = writer.write(range(65), cols)
+    close_table = writer.close()
+
+    with tf.Session() as sess:
+        sess.run(tf.global_variables_initializer())
+        sess.run(tf.local_variables_initializer())
+        coord = tf.train.Coordinator()
+        threads = tf.train.start_queue_runners(coord=coord)
+
+        sess.run(write_to_table, feed_dict=feed_dict)
+        sess.run(close_table)
+        coord.request_stop()
+        coord.join(threads)
